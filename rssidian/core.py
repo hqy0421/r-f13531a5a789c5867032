@@ -1,7 +1,7 @@
 import os
 import json
 import time
-from typing import List, Dict, Any, Optional, Tuple, Callable, Union
+from typing import List, Dict, Any, Optional, Tuple, Callable, Union, Sequence, Iterable
 from datetime import datetime, timedelta
 import logging
 import requests
@@ -15,6 +15,7 @@ from rich.progress import Progress, TextColumn, BarColumn, SpinnerColumn, TimeEl
 
 from .config import Config
 from .models import Article, Feed
+from .progress import IngestManifest
 from .rss import process_all_feeds
 
 # Configure logging
@@ -49,13 +50,27 @@ class RSSProcessor:
             self._embedding_model = SentenceTransformer('all-mpnet-base-v2')
         return self._embedding_model
 
-    def ingest_feeds(self, lookback_days: Optional[int] = None, debug: bool = False) -> Dict[str, int]:
+    def ingest_feeds(
+        self,
+        lookback_days: Optional[int] = None,
+        debug: bool = False,
+        manifest: Optional[IngestManifest] = None,
+        resume: bool = False,
+        only_sources: Optional[Sequence[str]] = None,
+        window_start: Optional[datetime] = None,
+        window_end: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
         """
         Ingest articles from all active feeds.
 
         Args:
             lookback_days: Number of days to look back for articles (default: config value)
             debug: Enable debug logging
+            manifest: Progress manifest to drive coverage-aware ingestion
+            resume: Only read ranges not yet confirmed in the manifest
+            only_sources: Restrict ingestion to these feed URLs
+            window_start: Explicit run window start (for resuming)
+            window_end: Explicit run window end (for resuming)
 
         Returns:
             Dictionary with ingestion statistics
@@ -74,19 +89,29 @@ class RSSProcessor:
                 max_errors=5,  # Maximum number of consecutive errors before marking feed as inactive
                 retry_attempts=3,  # Number of retry attempts for transient errors
                 config=self.config,  # Pass the config for article analysis
-                analyze_content=self.config.analyze_during_ingestion  # Whether to analyze during ingestion
+                analyze_content=self.config.analyze_during_ingestion,  # Whether to analyze during ingestion
+                manifest=manifest,
+                resume=resume,
+                only_sources=only_sources,
+                window_start=window_start,
+                window_end=window_end,
             )
         except Exception as e:
             logger.error(f"Error during ingestion: {str(e)}", exc_info=True)
             # Return empty stats in case of complete failure
             return {
                 "feeds_processed": 0,
+                "feeds_planned": 0,
+                "feeds_skipped": 0,
                 "new_articles": 0,
                 "auto_muted": 0,
                 "jina_enhanced": 0,
                 "with_summary": 0,
-                "with_value_analysis": 0
+                "with_value_analysis": 0,
+                "failed_sources": [],
+                "manifest_summary": manifest.summary_dict() if manifest else {},
             }
+
 
     def _call_openrouter_api(self, prompt: str, model: Optional[str] = None) -> Optional[str]:
         """
@@ -701,12 +726,18 @@ Provide a comprehensive summary that synthesizes information from all sources.""
             "groups_processed": 0
         }
 
-        # Track feed statistics updates
+        # Track which feeds had articles processed so their denormalized
+        # statistics can be reconciled from the database afterwards.
         feed_stats = defaultdict(lambda: {
             "new_articles": 0,
             "quality_tiers": defaultdict(int),
             "quality_scores": []
         })
+        # Seed with every feed that has an unprocessed article; articles may be
+        # marked processed without a quality tier, so the loop below cannot be
+        # relied on to enumerate every affected feed.
+        for article in unprocessed:
+            feed_stats[article.feed_id]
 
         # Process article groups using Rich progress bar
         with Progress(
@@ -890,40 +921,31 @@ Provide a comprehensive summary that synthesizes information from all sources.""
 
     def _update_feed_statistics(self, feed_stats: Dict[int, Dict[str, Any]]):
         """
-        Update feed statistics with processed article data.
+        Reconcile feed statistics with the articles actually stored.
 
         Args:
-            feed_stats: Dictionary of feed statistics keyed by feed_id
+            feed_stats: Dictionary of feed statistics keyed by feed_id. Used to
+                limit reconciliation to the feeds touched by this run; the
+                values themselves are ignored because the stored counters are
+                recomputed from the ``articles`` table.
         """
-        for feed_id, stats in feed_stats.items():
-            feed = self.db_session.query(Feed).filter_by(id=feed_id).first()
-            if not feed:
-                continue
+        from .stats import reconcile_feed_statistics
 
-            # Update article count
-            feed.article_count = (feed.article_count or 0) + stats["new_articles"]
+        result = reconcile_feed_statistics(
+            self.db_session, feed_ids=list(feed_stats.keys()), commit=True
+        )
+        if result["feeds_changed"]:
+            logger.info(
+                "Reconciled statistics for %s of %s feeds",
+                result["feeds_changed"],
+                result["feeds_checked"],
+            )
 
-            # Update quality tier counts
-            current_tier_counts = {}
-            if feed.quality_tier_counts:
-                try:
-                    current_tier_counts = json.loads(feed.quality_tier_counts)
-                except json.JSONDecodeError:
-                    current_tier_counts = {}
+    def reconcile_statistics(self, feed_ids: Optional[Iterable[int]] = None) -> Dict[str, Any]:
+        """Reconcile stored feed statistics with the articles table."""
+        from .stats import reconcile_feed_statistics
 
-            # Merge current and new tier counts
-            for tier, count in stats["quality_tiers"].items():
-                current_tier_counts[tier] = current_tier_counts.get(tier, 0) + count
-            feed.quality_tier_counts = json.dumps(current_tier_counts)
-
-            # Update average quality score
-            if stats["quality_scores"]:
-                current_total = (feed.avg_quality_score or 0) * (feed.article_count - stats["new_articles"] or 0)
-                new_total = current_total + sum(stats["quality_scores"])
-                feed.avg_quality_score = new_total / feed.article_count if feed.article_count > 0 else None
-
-        # Commit changes
-        self.db_session.commit()
+        return reconcile_feed_statistics(self.db_session, feed_ids=feed_ids, commit=True)
 
     def search(self, query: str, relevance_threshold: float = 0.3, max_results: int = 20, refresh: bool = False) -> List[Dict[str, Any]]:
         """

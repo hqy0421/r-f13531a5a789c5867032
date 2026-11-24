@@ -189,6 +189,17 @@ rssidian ingest
 # Process articles from last 30 days with debug output
 rssidian ingest --lookback 30 --debug
 
+# Inspect per-source progress recorded by the last run
+rssidian ingest-status
+rssidian ingest-status --json-output          # Emit the raw manifest for tooling
+
+# Retry only the sources/ranges that failed or were not confirmed
+rssidian ingest --resume                       # or: rssidian retry
+
+# Check/repair feed article counts against the actual database
+rssidian stats
+rssidian stats --fix
+
 # Search through article content using natural language (default relevance)
 rssidian search "impact of blockchain on cybersecurity"
 
@@ -244,6 +255,63 @@ This will display:
 - Number of total articles
 - Number of articles with embeddings
 - Other configuration settings
+
+## Resumable Ingestion
+
+A batch ingest covers many feed sources and can partially fail (a feed is down,
+the network drops, a run is interrupted). RSSidian records a **re-consumable
+progress manifest** so a retry does not re-read sources and time ranges that
+already succeeded.
+
+Each `rssidian ingest` run writes a JSON manifest (default
+`~/.local/share/rssidian/ingest-manifest.json`, configurable via
+`feeds.ingest_manifest_path`). For every source it records:
+
+- the **coverage** — time ranges that were successfully fetched and stored,
+- the **pending** ranges — requested ranges not yet confirmed,
+- the **status** (`success`, `failed`, or `unconfirmed`),
+- attempt counts, last error, and a rolling run history.
+
+The manifest is a stable, documented schema (`schema_version: 1`), so it can be
+consumed again by a later retry or by external tooling.
+
+```bash
+# First run: some sources succeed, some fail
+rssidian ingest
+
+# Inspect progress (human-readable table, or --json-output for the raw schema)
+rssidian ingest-status
+
+# Retry only the failed/unconfirmed sources, reading only their uncovered ranges
+rssidian ingest --resume
+
+# Equivalent, more discoverable spelling
+rssidian retry
+```
+
+Retries **merge by source and time overlap**: a source is identified by its feed
+URL, and confirmed coverage is the union of every successful attempt's ranges.
+A source is skipped only when its entire requested window is confirmed; when a
+success covered only part of the window (for example because the feed was
+capped at `max_articles_per_feed`), only the remaining tail is re-read. A source
+that is in-flight when the run is interrupted stays `unconfirmed` so the next
+`--resume` picks it up.
+
+## Feed Statistics Consistency
+
+Article counts shown by `subscriptions list`, `show-config`, `ingest-status`,
+and the MCP/HTTP APIs are always read from (or reconciled against) the actual
+`articles` table, so the reported inventory matches the database. To inspect or
+repair drift in the denormalized `Feed` counters:
+
+```bash
+rssidian stats          # report feeds whose stored stats disagree with the DB
+rssidian stats --fix    # rewrite stored stats to match the DB
+```
+
+`rssidian ingest`, `rssidian subscriptions list`, and the MCP feed-stats
+endpoints reconcile automatically, so the numbers you see always match what is
+stored.
 
 ## How It Works
 

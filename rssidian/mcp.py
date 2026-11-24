@@ -6,7 +6,6 @@ RSSidian's content, enabling natural language queries and responses about
 RSS feed content.
 """
 
-import json
 from typing import Dict, List, Any, Optional
 from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
@@ -38,7 +37,13 @@ class ModelContextProtocol:
             List of feed subscription details
         """
         feeds = self.db_session.query(Feed).order_by(Feed.title).all()
-        
+
+        # Report counts from the articles table so the inventory shown to AI
+        # agents matches what is actually stored.
+        from .stats import _bulk_statistics
+
+        actual_by_feed = _bulk_statistics(self.db_session, [feed.id for feed in feeds])
+
         result = []
         for feed in feeds:
             result.append({
@@ -50,9 +55,8 @@ class ModelContextProtocol:
                 "last_updated": feed.last_updated.isoformat() if feed.last_updated else None,
                 "muted": feed.muted,
                 "peer_through": feed.peer_through,
-                "article_count": feed.article_count
-            })
-        
+                "article_count": actual_by_feed.get(feed.id, {}).get("article_count", 0),
+            })        
         return result
     
     def get_articles(self, 
@@ -197,46 +201,45 @@ class ModelContextProtocol:
             feed = self.db_session.query(Feed).filter_by(title=feed_title).first()
             if not feed:
                 return {"error": "Feed not found"}
-            
-            # Parse quality tier counts
-            tier_counts = {}
-            if feed.quality_tier_counts:
-                try:
-                    tier_counts = json.loads(feed.quality_tier_counts)
-                except json.JSONDecodeError:
-                    tier_counts = {}
-            
+
+            # Report counts from the articles table so they always match the
+            # actual inventory (the denormalized columns can drift).
+            from .stats import compute_feed_statistics
+
+            actual = compute_feed_statistics(self.db_session, feed.id)
+
             return {
                 "id": feed.id,
                 "title": feed.title,
-                "article_count": feed.article_count,
-                "avg_quality_score": feed.avg_quality_score,
-                "quality_tier_counts": tier_counts,
+                "article_count": actual["article_count"],
+                "avg_quality_score": actual["avg_quality_score"],
+                "quality_tier_counts": actual["quality_tier_counts"],
                 "last_updated": feed.last_updated.isoformat() if feed.last_updated else None
             }
         else:
             # Get stats for all feeds
+            from .stats import _bulk_statistics
+
             feeds = self.db_session.query(Feed).all()
+            actual_by_feed = _bulk_statistics(self.db_session, [feed.id for feed in feeds])
+            empty = {"article_count": 0, "avg_quality_score": None, "quality_tier_counts": {}}
+
             result = {
                 "total_feeds": len(feeds),
-                "total_articles": sum(feed.article_count or 0 for feed in feeds),
+                "total_articles": sum(
+                    actual_by_feed.get(feed.id, empty)["article_count"] for feed in feeds
+                ),
                 "feeds": []
             }
-            
+
             for feed in feeds:
-                tier_counts = {}
-                if feed.quality_tier_counts:
-                    try:
-                        tier_counts = json.loads(feed.quality_tier_counts)
-                    except json.JSONDecodeError:
-                        tier_counts = {}
-                
+                actual = actual_by_feed.get(feed.id, empty)
                 result["feeds"].append({
                     "id": feed.id,
                     "title": feed.title,
-                    "article_count": feed.article_count,
-                    "avg_quality_score": feed.avg_quality_score,
-                    "quality_tier_counts": tier_counts
+                    "article_count": actual["article_count"],
+                    "avg_quality_score": actual["avg_quality_score"],
+                    "quality_tier_counts": actual["quality_tier_counts"]
                 })
-            
+
             return result

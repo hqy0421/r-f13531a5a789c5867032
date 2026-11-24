@@ -250,3 +250,9 @@ similarity_threshold = 0.65  # Lower value for better story merging (0.65 = 65% 
 
 # Whether to analyze articles during ingestion for better performance
 analyze_during_ingestion = true
+
+# Path to the re-consumable ingest progress manifest.
+# The manifest records, per source, which time ranges were confirmed so that
+# `rssidian ingest --resume` (or `rssidian retry`) only reads failed or
+# unconfirmed ranges and merges results by source and overlapping time range.
+ingest_manifest_path = "~/.local/share/rssidian/ingest-manifest.json"

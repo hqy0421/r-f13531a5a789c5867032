@@ -321,10 +321,18 @@ def list_subscriptions(ctx, sort, width):
     """List all feed subscriptions."""
     config = ctx.obj["config"]
     db_session = ensure_db_exists(config)
-    
+
     # Import models here
     from .models import Feed
-    
+    from .stats import reconcile_feed_statistics
+
+    # Heal denormalized counters before display so the Articles column always
+    # matches the articles actually stored in the database.
+    try:
+        reconcile_feed_statistics(db_session, commit=True)
+    except Exception as exc:  # pragma: no cover - defensive, display still works
+        logging.getLogger(__name__).warning("Could not reconcile feed statistics: %s", exc)
+
     # Query feeds with different sorting
     if sort == "title":
         feeds = db_session.query(Feed).order_by(Feed.title).all()
@@ -568,40 +576,114 @@ def disable_peer_through(ctx, feed_title):
     db_session.close()
 
 
-@cli.command()
-@click.option("--lookback", type=int, help="Number of days to look back for articles")
-@click.option("--debug/--no-debug", default=False, help="Enable debug output")
-@click.pass_context
-def ingest(ctx, lookback, debug):
-    """Ingest articles from RSS feeds."""
+def _load_ingest_manifest(config, path, resume):
+    """Load the ingest progress manifest for a run.
+
+    Without ``resume`` the previous progress is intentionally ignored so a
+    plain ``ingest`` re-reads the full lookback window. With ``resume`` the
+    recorded coverage is loaded and only failed/unconfirmed ranges are read.
+    """
+    from .progress import IngestManifest
+
+    manifest_path = path or config.ingest_manifest_path
+    if resume:
+        return IngestManifest.load(manifest_path), manifest_path
+    return IngestManifest.empty(path=manifest_path), manifest_path
+
+
+def _print_ingest_result(result):
+    """Report what a coverage-aware ingest run did, including retry guidance."""
+    summary = result.get("manifest_summary") or {}
+    click.echo(
+        f"Processed {result.get('feeds_processed', 0)} feeds "
+        f"(skipped {result.get('feeds_skipped', 0)} already confirmed), "
+        f"found {result.get('new_articles', 0)} new articles."
+    )
+
+    if result.get('auto_muted', 0) > 0:
+        click.echo(
+            f"Auto-muted {result['auto_muted']} feeds due to persistent errors. "
+            "Use 'subscriptions list' to see details."
+        )
+
+    if summary:
+        click.echo(
+            "Sources: "
+            f"{summary.get('success', 0)} confirmed, "
+            f"{summary.get('failed', 0)} failed, "
+            f"{summary.get('unconfirmed', 0)} unconfirmed, "
+            f"{summary.get('skipped', 0)} skipped."
+        )
+
+    pending = summary.get('failed', 0) + summary.get('unconfirmed', 0)
+    if pending:
+        click.echo(
+            f"{pending} source(s) still need work. "
+            "Run 'rssidian ingest --resume' to retry only those sources and ranges."
+        )
+
+
+def _run_ingest(ctx, lookback, debug, manifest_path, resume):
+    """Shared implementation for ``ingest`` and ``ingest --resume``."""
     config = ctx.obj["config"]
     db_session = ensure_db_exists(config)
-    
+
     # Import modules only when needed
     from .core import RSSProcessor
     from .markdown import write_digest_to_obsidian
     from .cost_tracker import init_cost_tracker, format_cost_summary
-    
+
     # Initialize cost tracker if enabled
     cost_tracking_enabled = config.cost_tracking_enabled
     if cost_tracking_enabled:
         init_cost_tracker()
-    
+
     # Suppress RSS module logs unless debug is enabled
     if not debug and not os.environ.get("DEBUG"):
         logging.getLogger("rssidian.rss").setLevel(logging.WARNING)
-    
+
     processor = RSSProcessor(config, db_session)
-    
+    manifest, manifest_path = _load_ingest_manifest(config, manifest_path, resume)
+
+    lookback_period = lookback or config.default_lookback
+
+    run_window_start = None
+    run_window_end = None
+    only_sources = None
+    if resume:
+        from .progress import parse_datetime, utcnow
+
+        # Reuse the window recorded by the manifest being resumed. A freshly
+        # computed window is shifted forward, which would leave a tiny
+        # uncovered sliver at the end of every source and defeat the purpose of
+        # resuming. Only if no window was recorded do we derive one.
+        recorded = manifest.data.get("window") or {}
+        run_window_start = parse_datetime(recorded.get("start"))
+        run_window_end = parse_datetime(recorded.get("end"))
+        if run_window_start is None or run_window_end is None:
+            run_window_end = utcnow()
+            run_window_start = run_window_end - timedelta(days=lookback_period)
+
+        only_sources = manifest.retry_sources(run_window_start, run_window_end)
+        if not only_sources:
+            click.echo("Nothing to resume: every source range is already confirmed.")
+            db_session.close()
+            return
+
     try:
         # Step 1: Fetch articles from feeds
-        result = processor.ingest_feeds(lookback_days=lookback, debug=debug)
-        click.echo(f"Processed {result['feeds_processed']} feeds, found {result['new_articles']} new articles.")
-        
-        # Display information about auto-muted feeds if any
-        if 'auto_muted' in result and result['auto_muted'] > 0:
-            click.echo(f"Auto-muted {result['auto_muted']} feeds due to persistent errors. Use 'subscriptions list' to see details.")
-        
+        result = processor.ingest_feeds(
+            lookback_days=lookback,
+            debug=debug,
+            manifest=manifest,
+            resume=resume,
+            only_sources=only_sources,
+            window_start=run_window_start,
+            window_end=run_window_end,
+        )
+        manifest.save(manifest_path)
+        _print_ingest_result(result)
+
         # Step 2: Process fetched articles (summary, value analysis, embeddings)
         if result['new_articles'] > 0:
             click.echo("Processing new articles...")
@@ -619,32 +701,211 @@ def ingest(ctx, lookback, debug):
             click.echo(f"Backfilled embeddings: {backfill_result['succeeded']}/{backfill_result['total']} "
                        f"({backfill_result['failed']} failed)")
 
+        # Step 2c: Reconcile denormalized feed statistics with the database so
+        # article counts reported by list/stats/MCP match reality.
+        stats_result = processor.reconcile_statistics()
+        if stats_result['feeds_changed']:
+            click.echo(
+                f"Reconciled statistics for {stats_result['feeds_changed']} feed(s) "
+                "to match the article database."
+            )
+
         # Step 3: Generate digest
         click.echo("Generating digest...")
-        lookback_period = lookback or config.default_lookback
         digest = processor.generate_digest(lookback_days=lookback_period)
-        
+
         # Step 4: Write digest to Obsidian
         file_path = write_digest_to_obsidian(digest, config)
         if file_path:
             click.echo(f"Wrote digest to {file_path}")
         else:
             click.echo("Failed to write digest to Obsidian.")
-        
+
         # Display cost summary if enabled
         if cost_tracking_enabled:
             click.echo("\n" + format_cost_summary())
-        
+
     except Exception as e:
         click.echo(f"Error during ingestion: {str(e)}", err=True)
         if debug:
             import traceback
             click.echo(traceback.format_exc())
+        # Preserve progress recorded so far so --resume can continue.
+        try:
+            manifest.save(manifest_path)
+        except OSError:
+            pass
         # Still show cost summary on error if enabled
         if cost_tracking_enabled:
             click.echo("\n" + format_cost_summary())
     finally:
         db_session.close()
+
+
+@cli.command()
+@click.option("--lookback", type=int, help="Number of days to look back for articles")
+@click.option("--debug/--no-debug", default=False, help="Enable debug output")
+@click.option("--resume", is_flag=True,
+              help="Retry only failed or unconfirmed sources and time ranges")
+@click.option("--manifest", "manifest_path", type=click.Path(),
+              help="Path to the ingest progress manifest (overrides config)")
+@click.pass_context
+def ingest(ctx, lookback, debug, resume, manifest_path):
+    """Ingest articles from RSS feeds.
+
+    Each run writes a re-consumable progress manifest (per source, per time
+    range). After a partial failure, ``--resume`` reads that manifest and
+    retries only the sources and ranges that are still failed or unconfirmed.
+    """
+    _run_ingest(ctx, lookback, debug, manifest_path, resume)
+
+
+@cli.command()
+@click.option("--lookback", type=int, help="Number of days to look back for articles")
+@click.option("--debug/--no-debug", default=False, help="Enable debug output")
+@click.option("--manifest", "manifest_path", type=click.Path(),
+              help="Path to the ingest progress manifest (overrides config)")
+@click.pass_context
+def retry(ctx, lookback, debug, manifest_path):
+    """Retry the failed or unconfirmed sources from the last ingest run.
+
+    Equivalent to ``rssidian ingest --resume``: it reads the progress manifest
+    and only reads the ranges that were not confirmed, merging results back by
+    source and overlapping time range.
+    """
+    _run_ingest(ctx, lookback, debug, manifest_path, resume=True)
+
+
+@cli.command("ingest-status")
+@click.option("--manifest", "manifest_path", type=click.Path(),
+              help="Path to the ingest progress manifest (overrides config)")
+@click.option("--json-output", is_flag=True, help="Print the raw manifest JSON")
+@click.pass_context
+def ingest_status(ctx, manifest_path, json_output):
+    """Show per-source progress recorded by the last ingest run."""
+    config = ctx.obj["config"]
+    from .progress import IngestManifest, STATUS_FAILED, STATUS_UNCONFIRMED
+
+    path = manifest_path or config.ingest_manifest_path
+    manifest = IngestManifest.load(path)
+    sources = manifest.data.get("sources") or []
+
+    if json_output:
+        click.echo(manifest.to_json())
+        return
+
+    if not sources:
+        click.echo(f"No ingest progress recorded yet at {path}.")
+        return
+
+    table = Table(box=box.ROUNDED, header_style="bold magenta")
+    table.add_column("Source")
+    table.add_column("Status")
+    table.add_column("Attempts", justify="right")
+    table.add_column("New", justify="right")
+    table.add_column("Pending ranges", justify="right")
+
+    for source in sources:
+        status = source.get("status") or STATUS_UNCONFIRMED
+        color = "green" if status == "success" else ("red" if status == STATUS_FAILED else "yellow")
+        table.add_row(
+            source.get("title") or source.get("url", ""),
+            f"[{color}]{status}[/{color}]",
+            str(source.get("attempts") or 0),
+            str(source.get("total_articles_new") or 0),
+            str(len(source.get("pending") or [])),
+        )
+
+    console.print(table)
+    summary = manifest.summary_dict()
+    console.print(
+        f"[dim]Last run:[/dim] {manifest.data.get('run_id')} "
+        f"[dim]window[/dim] {manifest.data.get('window', {}).get('start')} "
+        f"-> {manifest.data.get('window', {}).get('end')}"
+    )
+    console.print(
+        f"Confirmed: {summary.get('success', 0)}  "
+        f"Failed: {summary.get('failed', 0)}  "
+        f"Unconfirmed: {summary.get('unconfirmed', 0)}  "
+        f"Skipped: {summary.get('skipped', 0)}"
+    )
+    click.echo(f"Manifest: {path}")
+
+
+@cli.command()
+@click.option("--fix", is_flag=True,
+              help="Rewrite stored stats so they match the article database")
+@click.pass_context
+def stats(ctx, fix):
+    """Report (and optionally repair) feed article statistics.
+
+    Compares each feed's stored ``article_count``, average quality score and
+    quality-tier counts against the articles actually present in the database.
+    With ``--fix`` the stored values are rewritten to match reality.
+    """
+    config = ctx.obj["config"]
+    db_session = ensure_db_exists(config)
+
+    from .models import Feed
+    from .stats import compute_feed_statistics, reconcile_feed_statistics
+
+    feeds = db_session.query(Feed).order_by(Feed.title).all()
+    mismatches = []
+
+    for feed in feeds:
+        actual = compute_feed_statistics(db_session, feed.id)
+        stored_count = feed.article_count or 0
+        actual_tier_json = (
+            json.dumps(actual["quality_tier_counts"]) if actual["quality_tier_counts"] else None
+        )
+        if (
+            stored_count != actual["article_count"]
+            or feed.quality_tier_counts != actual_tier_json
+            or feed.avg_quality_score != actual["avg_quality_score"]
+        ):
+            mismatches.append((feed, stored_count, actual))
+
+    if not mismatches:
+        console.print(
+            f"[green]All {len(feeds)} feed(s) match the article database.[/green]"
+        )
+        if fix:
+            result = reconcile_feed_statistics(db_session, commit=True)
+            console.print(f"Reconciled {result['feeds_changed']} feed(s).")
+        db_session.close()
+        return
+
+    table = Table(box=box.ROUNDED, header_style="bold magenta")
+    table.add_column("Feed")
+    table.add_column("Stored count", justify="right")
+    table.add_column("Actual count", justify="right")
+    table.add_column("Stored avg", justify="right")
+    table.add_column("Actual avg", justify="right")
+
+    for feed, stored_count, actual in mismatches:
+        table.add_row(
+            feed.title,
+            str(stored_count),
+            f"[bold]{actual['article_count']}[/bold]",
+            "-" if feed.avg_quality_score is None else f"{feed.avg_quality_score:.1f}",
+            "-" if actual["avg_quality_score"] is None else f"{actual['avg_quality_score']:.1f}",
+        )
+
+    console.print(table)
+
+    if fix:
+        result = reconcile_feed_statistics(db_session, commit=True)
+        console.print(
+            f"[green]Reconciled {result['feeds_changed']} of "
+            f"{result['feeds_checked']} feed(s) with the article database.[/green]"
+        )
+    else:
+        console.print(
+            f"[yellow]{len(mismatches)} feed(s) disagree with the database. "
+            "Run 'rssidian stats --fix' to repair.[/yellow]"
+        )
+
+    db_session.close()
 
 
 @cli.command()

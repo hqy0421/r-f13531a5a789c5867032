@@ -8,6 +8,7 @@ DEFAULT_CONFIG_DIR = os.path.expanduser("~/.config/rssidian")
 DEFAULT_DB_PATH = os.path.expanduser("~/.local/share/rssidian/rssidian.db")
 DEFAULT_CONFIG_PATH = os.path.join(DEFAULT_CONFIG_DIR, "config.toml")
 DEFAULT_BACKUP_DIR = os.path.expanduser("~/.local/share/rssidian/backups")
+DEFAULT_INGEST_MANIFEST_PATH = os.path.expanduser("~/.local/share/rssidian/ingest-manifest.json")
 
 
 class Config:
@@ -163,6 +164,15 @@ Content:
         """Get backup directory."""
         os.makedirs(DEFAULT_BACKUP_DIR, exist_ok=True)
         return DEFAULT_BACKUP_DIR
+
+    @property
+    def ingest_manifest_path(self) -> str:
+        """Get the path of the re-consumable ingest progress manifest."""
+        path = self.get("feeds", "ingest_manifest_path", "~/.local/share/rssidian/ingest-manifest.json")
+        expanded_path = os.path.expanduser(path)
+        os.makedirs(os.path.dirname(expanded_path), exist_ok=True)
+        return expanded_path
+
         
     @property
     def analyze_during_ingestion(self) -> bool:

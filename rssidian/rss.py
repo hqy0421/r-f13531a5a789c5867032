@@ -5,7 +5,8 @@ import re
 import json
 import email.utils
 import dateutil.parser
-from typing import List, Dict, Any, Optional, Tuple, Callable
+from dataclasses import dataclass, field
+from typing import List, Dict, Any, Optional, Tuple, Callable, Sequence
 from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 from tqdm import tqdm
@@ -14,6 +15,15 @@ from rich.progress import Progress, TextColumn, BarColumn, SpinnerColumn, TimeEl
 
 from .models import Feed, Article
 from .config import Config
+from .progress import (
+    STATUS_FAILED,
+    STATUS_SUCCESS,
+    STATUS_UNCONFIRMED,
+    IngestManifest,
+    interval_contains,
+    to_naive,
+    utcnow,
+)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -402,214 +412,403 @@ def parse_published_date(entry: Dict[str, Any]) -> Optional[datetime]:
                     continue
     
     # As a last resort, check if there's a date in the title or description
-    for field in ['title', 'description', 'summary']:
-        if field in entry and entry[field] and isinstance(entry[field], str):
+    for entry_field in ['title', 'description', 'summary']:
+        if entry_field in entry and entry[entry_field] and isinstance(entry[entry_field], str):
             # Look for common date patterns in the text
             try:
                 # Use dateutil's parser with fuzzy matching
-                return dateutil.parser.parse(entry[field], fuzzy=True)
+                return dateutil.parser.parse(entry[entry_field], fuzzy=True)
             except (ValueError, TypeError):
                 pass
     
     return None
 
 
-def get_feed_entries(feed_url: str, lookback_days: int = 7, max_retries: int = 3, retry_delay: int = 2) -> List[Dict[str, Any]]:
+@dataclass
+class FeedFetchResult:
+    """Outcome of fetching a single feed."""
+
+    entries: List[Dict[str, Any]] = field(default_factory=list)
+    status: str = STATUS_SUCCESS
+    error: Optional[str] = None
+    http_status: Optional[int] = None
+    feed_title: Optional[str] = None
+
+
+@dataclass
+class FeedIngestResult:
+    """Outcome of ingesting one feed source for a run window.
+
+    The manifest consumes these fields directly; see ``rssidian.progress``.
     """
-    Fetch and parse a feed, returning entries within lookback period.
-    
+
+    feed_id: Optional[int]
+    feed_title: str
+    feed_url: str
+    status: str
+    window_start: datetime
+    window_end: datetime
+    coverage: List[Tuple[datetime, datetime]] = field(default_factory=list)
+    articles_seen: int = 0
+    articles_new: int = 0
+    jina_enhanced: int = 0
+    with_summary: int = 0
+    with_value: int = 0
+    truncated: bool = False
+    error: Optional[str] = None
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+
+
+def fetch_feed_entries(
+    feed_url: str,
+    max_retries: int = 3,
+    retry_delay: int = 2,
+) -> FeedFetchResult:
+    """
+    Fetch and parse a feed, distinguishing transport failure from an empty feed.
+
     Args:
         feed_url: URL of the RSS feed
-        lookback_days: Number of days to look back for articles
         max_retries: Maximum number of retry attempts for transient errors
         retry_delay: Delay between retries in seconds
-        
+
     Returns:
-        List of feed entries within the lookback period
+        FeedFetchResult with raw entries and a success/failed status
     """
+    last_error: Optional[str] = None
+    http_status: Optional[int] = None
+
     for attempt in range(max_retries):
         try:
             # Add a user agent to avoid 403 errors
             headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
-            
+
             # Use requests to get the content first to handle redirects and HTTP errors better
-            response = None
+            request_error: Optional[str] = None
             try:
                 response = requests.get(feed_url, headers=headers, timeout=30)
+                http_status = response.status_code
                 response.raise_for_status()  # Raise exception for 4XX/5XX status codes
                 feed_data = feedparser.parse(response.content)
             except requests.exceptions.RequestException as req_err:
                 # If requests fails, try direct parsing as fallback
                 logger.warning(f"Request failed for {feed_url}, trying direct parsing: {str(req_err)}")
+                request_error = str(req_err)
                 feed_data = feedparser.parse(feed_url)
-            
+
             # Check if the feed has a bozo exception (parsing error)
+            bozo = False
             if hasattr(feed_data, 'bozo') and feed_data.bozo and hasattr(feed_data, 'bozo_exception'):
                 # Some bozo exceptions are acceptable, others indicate real problems
                 if not isinstance(feed_data.bozo_exception, feedparser.CharacterEncodingOverride):
+                    bozo = True
                     logger.warning(f"Feed parsing warning for {feed_url}: {str(feed_data.bozo_exception)}")
-            
+
             # Check HTTP status
             if hasattr(feed_data, 'status') and feed_data.status >= 400:
                 error_msg = f"Error fetching feed {feed_url}: HTTP {feed_data.status}"
+                last_error = error_msg
                 if attempt < max_retries - 1:
                     logger.warning(f"{error_msg}, retrying in {retry_delay} seconds (attempt {attempt+1}/{max_retries})")
                     time.sleep(retry_delay)
                     continue
-                else:
-                    logger.error(error_msg)
-                    return []
-            
-            # Check if feed has entries
+                logger.error(error_msg)
+                return FeedFetchResult(status=STATUS_FAILED, error=error_msg, http_status=http_status)
+
+            # No entries is only a failure when the feed was unparseable or the
+            # request itself failed; an empty but valid feed is a success.
             if not feed_data.entries:
+                if bozo or request_error:
+                    error_msg = request_error or f"Could not parse feed {feed_url}"
+                    last_error = error_msg
+                    if attempt < max_retries - 1:
+                        logger.warning(f"{error_msg}, retrying in {retry_delay} seconds (attempt {attempt+1}/{max_retries})")
+                        time.sleep(retry_delay)
+                        continue
+                    logger.error(f"Failed to fetch feed {feed_url}: {error_msg}")
+                    return FeedFetchResult(
+                        status=STATUS_FAILED, error=error_msg, http_status=http_status
+                    )
                 logger.warning(f"No entries found in feed {feed_url}")
-                return []
-            
-            # Calculate lookback date
-            lookback_date = datetime.utcnow() - timedelta(days=lookback_days)
-            
-            # Filter entries by date if possible
-            recent_entries = []
-            for entry in feed_data.entries:
-                published_date = parse_published_date(entry)
-                
-                # If no date available, include the entry
-                if not published_date:
-                    recent_entries.append(entry)
-                    continue
-                
-                # Include entry if it's within lookback period
-                if published_date >= lookback_date:
-                    recent_entries.append(entry)
-            
-            return recent_entries
-        
+                return FeedFetchResult(
+                    entries=[],
+                    status=STATUS_SUCCESS,
+                    http_status=http_status,
+                    feed_title=getattr(feed_data.feed, 'title', None),
+                )
+
+            return FeedFetchResult(
+                entries=list(feed_data.entries),
+                status=STATUS_SUCCESS,
+                http_status=http_status,
+                feed_title=getattr(feed_data.feed, 'title', None),
+            )
+
         except Exception as e:
+            last_error = str(e)
             if attempt < max_retries - 1:
                 logger.warning(f"Error processing feed {feed_url}: {str(e)}, retrying in {retry_delay} seconds (attempt {attempt+1}/{max_retries})")
                 time.sleep(retry_delay)
             else:
                 logger.error(f"Failed to process feed {feed_url} after {max_retries} attempts: {str(e)}")
-                return []
+                return FeedFetchResult(
+                    status=STATUS_FAILED, error=last_error, http_status=http_status
+                )
+
+    return FeedFetchResult(status=STATUS_FAILED, error=last_error, http_status=http_status)
+
+
+def get_feed_entries(feed_url: str, lookback_days: int = 7, max_retries: int = 3, retry_delay: int = 2) -> List[Dict[str, Any]]:
+    """
+    Fetch and parse a feed, returning entries within lookback period.
+
+    Args:
+        feed_url: URL of the RSS feed
+        lookback_days: Number of days to look back for articles
+        max_retries: Maximum number of retry attempts for transient errors
+        retry_delay: Delay between retries in seconds
+
+    Returns:
+        List of feed entries within the lookback period
+    """
+    fetch = fetch_feed_entries(feed_url, max_retries=max_retries, retry_delay=retry_delay)
+    if fetch.status != STATUS_SUCCESS:
+        return []
+
+    lookback_date = datetime.utcnow() - timedelta(days=lookback_days)
+    recent_entries = []
+    for entry in fetch.entries:
+        published_date = parse_published_date(entry)
+        if not published_date or published_date >= lookback_date:
+            recent_entries.append(entry)
+    return recent_entries
+
+
+def _filter_entries_by_ranges(
+    entries: List[Dict[str, Any]],
+    ranges: Optional[Sequence[Tuple[datetime, datetime]]],
+) -> List[Dict[str, Any]]:
+    """Keep entries whose publication date falls in any of ``ranges``.
+
+    Entries without a parseable date are always kept: they cannot be placed in
+    time, so dropping them would silently lose articles.
+    """
+    if not ranges:
+        return list(entries)
+
+    normalized = [(to_naive(start), to_naive(end)) for start, end in ranges]
+    selected = []
+    for entry in entries:
+        published_date = parse_published_date(entry)
+        if published_date is None or interval_contains(normalized, published_date):
+            selected.append(entry)
+    return selected
+
+
+def _success_coverage(
+    ranges: Sequence[Tuple[datetime, datetime]],
+    kept_entries: Sequence[Tuple[Dict[str, Any], Optional[datetime]]],
+    truncated: bool,
+) -> List[Tuple[datetime, datetime]]:
+    """Compute the time ranges a successful fetch can confirm.
+
+    When the feed holds more entries than ``max_articles`` we cannot prove we
+    saw everything older than the oldest kept entry, so coverage is clipped to
+    start there. Without truncation the whole requested range is confirmed.
+    """
+    normalized = [(to_naive(start), to_naive(end)) for start, end in ranges]
+    if not truncated:
+        return normalized
+
+    dated = [date for _, date in kept_entries if date is not None]
+    if not dated:
+        return normalized
+
+    oldest_kept = min(dated)
+    coverage = []
+    for start, end in normalized:
+        if oldest_kept >= end:
+            continue
+        coverage.append((max(start, oldest_kept), end))
+    return coverage
 
 
 def process_feed(
-    feed: Feed, 
-    db_session: Session, 
+    feed: Feed,
+    db_session: Session,
     lookback_days: int = 7,
     max_articles: int = 25,
     progress_callback: Optional[Callable[[str], None]] = None,
     max_errors: int = 5,  # Maximum number of consecutive errors before marking feed as inactive
     retry_attempts: int = 3,  # Number of retry attempts for transient errors
     config: Optional[Config] = None,  # Configuration for article analysis
-    analyze_content: bool = True  # Whether to analyze content during ingestion
-) -> Tuple[int, int, int, int]:
+    analyze_content: bool = True,  # Whether to analyze content during ingestion
+    entry_ranges: Optional[Sequence[Tuple[datetime, datetime]]] = None,  # Time ranges to read
+    window_start: Optional[datetime] = None,
+    window_end: Optional[datetime] = None,
+) -> FeedIngestResult:
     """
     Process a feed, fetch new articles and store them in the database.
-    
+
     Args:
         feed: Feed object
         db_session: SQLAlchemy database session
-        lookback_days: Number of days to look back for articles
+        lookback_days: Number of days to look back for articles (used when
+            ``entry_ranges`` is not given)
         max_articles: Maximum number of articles to process per feed
         progress_callback: Optional callback function for progress updates
         max_errors: Maximum number of consecutive errors before marking feed as inactive
         retry_attempts: Number of retry attempts for transient errors
         config: Configuration for article analysis
         analyze_content: Whether to analyze content during ingestion
-        
+        entry_ranges: Explicit time ranges to read; only entries published in
+            these ranges are considered. Defaults to the whole lookback window.
+        window_start: Start of this run's window (for coverage reporting)
+        window_end: End of this run's window (for coverage reporting)
+
     Returns:
-        Tuple of (new_articles, jina_enhanced, with_summary, with_value_analysis)
+        FeedIngestResult describing what was read, stored and confirmed
     """
+    started_at = utcnow()
+    if window_end is None:
+        window_end = started_at
+    if window_start is None:
+        window_start = to_naive(window_end) - timedelta(days=lookback_days)
+    window_start, window_end = to_naive(window_start), to_naive(window_end)
+
+    if entry_ranges is None:
+        entry_ranges = [(window_start, window_end)]
+    ranges = [(to_naive(start), to_naive(end)) for start, end in entry_ranges]
+
+    result = FeedIngestResult(
+        feed_id=feed.id,
+        feed_title=feed.title,
+        feed_url=feed.url,
+        status=STATUS_UNCONFIRMED,
+        window_start=window_start,
+        window_end=window_end,
+        started_at=started_at,
+    )
+
     if feed.muted:
         if progress_callback:
             progress_callback(f"Skipping muted feed: {feed.title}")
-        return 0, 0, 0, 0
-    
+        result.status = STATUS_UNCONFIRMED
+        result.error = "feed is muted"
+        result.finished_at = utcnow()
+        return result
+
     if progress_callback:
         progress_callback(f"Processing feed: {feed.title}")
-    
+
     # Always update the last checked timestamp
     feed.last_checked = datetime.utcnow()
-    
+
     try:
-        # Get feed entries with retry logic
-        entries = get_feed_entries(feed.url, lookback_days, max_retries=retry_attempts)
-        
-        # If no entries were found, this might be a temporary issue or a feed that rarely updates
-        if not entries:
-            # Only increment error count for HTTP errors (which would be logged as errors)
-            # Don't increment for feeds that simply have no new entries
-            feed.no_entries_count = getattr(feed, 'no_entries_count', 0) + 1
-            
-            # If we consistently find no entries for a long time, log a warning
-            if feed.no_entries_count > 5:  # After 5 consecutive checks with no entries
-                logger.warning(f"Feed {feed.title} has had no entries for {feed.no_entries_count} consecutive checks")
-            
+        # Get feed entries with retry logic. Fetching is retried here, but a
+        # failure is reported instead of being flattened into "no entries" so
+        # the manifest can mark the source failed rather than confirmed-empty.
+        fetch = fetch_feed_entries(feed.url, max_retries=retry_attempts)
+        if fetch.status != STATUS_SUCCESS:
+            result.status = STATUS_FAILED
+            result.error = fetch.error or "feed fetch failed"
+            feed.error_count = getattr(feed, 'error_count', 0) + 1
+            feed.last_error = result.error
+            if feed.error_count >= max_errors:
+                logger.warning(f"Feed {feed.title} has had {feed.error_count} consecutive errors. Marking as muted.")
+                feed.muted = True
+                feed.muted_reason = f"Auto-muted after {feed.error_count} consecutive errors. Last error: {feed.last_error}"
             db_session.commit()
-            return 0, 0, 0, 0
-        
+            result.finished_at = utcnow()
+            return result
+
+        # Only consider entries inside the ranges this run is responsible for.
+        entries = _filter_entries_by_ranges(fetch.entries, ranges)
+
+        if not entries:
+            # Distinguish a genuinely empty feed from a feed that has entries
+            # but none in this run's (possibly partial) ranges: only the former
+            # is a "no entries" health signal.
+            if not fetch.entries:
+                feed.no_entries_count = getattr(feed, 'no_entries_count', 0) + 1
+                if feed.no_entries_count > 5:
+                    logger.warning(f"Feed {feed.title} has had no entries for {feed.no_entries_count} consecutive checks")
+            else:
+                feed.no_entries_count = 0
+
+            # A successful fetch confirms the requested ranges even when empty.
+            result.status = STATUS_SUCCESS
+            result.coverage = list(ranges)
+            feed.error_count = 0
+            feed.last_error = None
+            db_session.commit()
+            result.finished_at = utcnow()
+            return result
+
         # Reset no entries counter if we found entries
         feed.no_entries_count = 0
-        
+
         # Sort entries by date if possible, newest first
         sorted_entries = []
         for entry in entries:
             published_date = parse_published_date(entry)
-            sorted_entries.append((entry, published_date or datetime.min))
-        
-        sorted_entries.sort(key=lambda x: x[1], reverse=True)
-        
+            sorted_entries.append((entry, published_date))
+
+        sorted_entries.sort(key=lambda x: x[1] or datetime.min, reverse=True)
+        result.articles_seen = len(sorted_entries)
+
         # Limit to max_articles
+        truncated = len(sorted_entries) > max_articles
         sorted_entries = sorted_entries[:max_articles]
-        
+
         new_article_count = 0
         jina_enhanced_count = 0
         with_summary_count = 0
         with_value_count = 0
-        
+
         for entry, published_date in sorted_entries:
             guid = entry.get('id', entry.get('link', ''))
             if not guid:
                 continue
-            
+
             # Get the article URL first to check for URL-based duplicates
             article_url = entry.get('link', guid)
-            
+
             # Check if article already exists by GUID or URL
             existing_article = db_session.query(Article).filter(
                 (Article.guid == guid) | (Article.url == article_url)
             ).first()
             if existing_article:
                 continue
-            
+
             # Extract content from feed entry
             content = extract_content(entry)
-            
+
             # Try to fetch content from Jina.ai in these cases:
             # 1. No content was found in the feed
             # 2. Content is too short (likely truncated)
             # 3. Content appears to be just a summary or snippet
             jina_enhanced = False
             should_fetch_jina = (
-                not content or 
+                not content or
                 len(content) < 1000 or  # Content is suspiciously short
                 "[...]".lower() in content.lower() or  # Content contains ellipsis indicating truncation
                 "read more".lower() in content.lower() or  # Content has "read more" prompt
                 "continue reading".lower() in content.lower()  # Content has "continue reading" prompt
             )
-            
+
             # Check if this is an aggregator feed that needs to peer through to the origin article
             if feed.peer_through and entry.get('description'):
                 origin_url = extract_origin_url(entry.get('description', ''))
                 if origin_url and origin_url != article_url:
                     logger.info(f"Feed is marked for peer-through. Using origin URL: {origin_url} instead of {article_url}")
                     article_url = origin_url
-            
+
             if should_fetch_jina and article_url.startswith('http'):
                 logger.info(f"Content may be incomplete for {article_url}, attempting to fetch from Jina.ai")
                 jina_content = fetch_jina_content(article_url)
-                
+
                 if jina_content and (not content or len(jina_content) > len(content)):
                     logger.info(f"Using Jina.ai content for {article_url} - {len(jina_content)} chars vs original {len(content)} chars")
                     content = jina_content
@@ -705,46 +904,64 @@ def process_feed(
             
             db_session.add(new_article)
             new_article_count += 1
-        
+
         # Update feed last updated timestamp if new articles were found
         if new_article_count > 0:
             feed.last_updated = datetime.utcnow()
-        
-        # Reset error count if successful
+
+        # Reset error count on a successful fetch
         feed.error_count = 0
         feed.last_error = None
-        
+
         db_session.commit()
-        return new_article_count, jina_enhanced_count, with_summary_count, with_value_count
-    
+
+        result.status = STATUS_SUCCESS
+        result.coverage = _success_coverage(ranges, sorted_entries, truncated)
+        result.articles_new = new_article_count
+        result.jina_enhanced = jina_enhanced_count
+        result.with_summary = with_summary_count
+        result.with_value = with_value_count
+        result.truncated = truncated
+        result.finished_at = utcnow()
+        return result
+
     except Exception as e:
         logger.error(f"Error processing feed {feed.title}: {str(e)}")
         # Update error information
         feed.error_count = getattr(feed, 'error_count', 0) + 1
         feed.last_error = str(e)
-        
+
         # Check if we should mark the feed as inactive due to too many errors
         if feed.error_count >= max_errors:
             logger.warning(f"Feed {feed.title} has had {feed.error_count} consecutive errors. Marking as muted.")
             feed.muted = True
             feed.muted_reason = f"Auto-muted after {feed.error_count} consecutive errors. Last error: {feed.last_error}"
-        
+
         db_session.commit()
-        return 0, 0, 0, 0
+        result.status = STATUS_FAILED
+        result.error = str(e)
+        result.finished_at = utcnow()
+        return result
 
 
 def process_all_feeds(
-    db_session: Session, 
+    db_session: Session,
     lookback_days: int = 7,
     max_articles_per_feed: int = 25,
     max_errors: int = 5,
     retry_attempts: int = 3,
     config: Optional[Config] = None,
-    analyze_content: bool = True
-) -> Dict[str, int]:
+    analyze_content: bool = True,
+    manifest: Optional[IngestManifest] = None,
+    resume: bool = False,
+    only_sources: Optional[Sequence[str]] = None,
+    show_progress: bool = True,
+    window_start: Optional[datetime] = None,
+    window_end: Optional[datetime] = None,
+) -> Dict[str, Any]:
     """
     Process all active feeds in the database.
-    
+
     Args:
         db_session: SQLAlchemy database session
         lookback_days: Number of days to look back for articles
@@ -753,30 +970,64 @@ def process_all_feeds(
         retry_attempts: Number of retry attempts for transient errors
         config: Configuration for article analysis
         analyze_content: Whether to analyze content during ingestion
-        
+        manifest: Progress manifest to read coverage from and record into. A
+            fresh one is created when omitted.
+        resume: When True, only read time ranges not already confirmed in the
+            manifest, and only revisit sources listed as ``only_sources``.
+        only_sources: Restrict processing to these feed URLs (used by retries
+            to target failed or unconfirmed sources).
+        show_progress: Whether to render the Rich progress bar
+        window_start: Explicit run window start. Required with ``window_end``
+            when resuming, so the retry targets the window recorded in the
+            manifest rather than a freshly shifted one.
+        window_end: Explicit run window end.
+
     Returns:
-        Dictionary with processing statistics
+        Dictionary with processing statistics and the manifest summary
     """
+    if window_end is None:
+        window_end = utcnow()
+    if window_start is None:
+        window_start = window_end - timedelta(days=lookback_days)
+
     feeds = db_session.query(Feed).filter_by(muted=False).all()
-    
-    if not feeds:
+
+    if only_sources is not None:
+        # An explicit (possibly empty) list means "these sources only"; an
+        # empty list is a legitimate no-op, not "everything".
+        wanted = set(only_sources)
+        feeds = [feed for feed in feeds if feed.url in wanted]
+
+    if manifest is None:
+        manifest = IngestManifest.empty(lookback_days)
+    manifest.begin(window_start, window_end, lookback_days=lookback_days)
+
+    plans = manifest.plan(feeds, window_start, window_end)
+
+    if not plans:
         logger.warning("No active feeds found in database")
         return {
-            "feeds_processed": 0, 
-            "new_articles": 0, 
+            "feeds_processed": 0,
+            "feeds_planned": 0,
+            "feeds_skipped": 0,
+            "new_articles": 0,
             "auto_muted": 0,
             "jina_enhanced": 0,
             "with_summary": 0,
-            "with_value_analysis": 0
+            "with_value_analysis": 0,
+            "failed_sources": [],
+            "manifest_summary": manifest.summary_dict(),
         }
-    
+
     total_new_articles = 0
     auto_muted_count = 0
     total_jina_enhanced = 0
     total_with_summary = 0
     total_with_value = 0
-    # Create a beautiful Rich progress bar
-    with Progress(
+    skipped_count = 0
+    failed_sources: List[str] = []
+
+    progress_cm = Progress(
         SpinnerColumn(),
         TextColumn("[bold blue]{task.description}"),
         BarColumn(bar_width=40, complete_style="green", finished_style="green"),
@@ -785,65 +1036,121 @@ def process_all_feeds(
         TimeElapsedColumn(),
         TimeRemainingColumn(),
         TextColumn("[bold]{task.fields[stats]}"),
-        expand=True
-    ) as progress:
+        expand=True,
+        disable=not show_progress,
+    )
+
+    with progress_cm as progress:
         # Add the main task
-        main_task = progress.add_task(f"[bold]Processing {len(feeds)} feeds", total=len(feeds), stats="")
-        
-        for feed in feeds:
+        main_task = progress.add_task(
+            f"[bold]Processing {len(plans)} feeds", total=len(plans), stats=""
+        )
+
+        for plan in plans:
+            feed = plan.feed
+            feed_title = plan.title
+
+            if not plan.should_process:
+                skipped_count += 1
+                progress.update(
+                    main_task,
+                    description=f"[bold blue]Skipping: [cyan]{feed_title[:40]}",
+                    stats="[dim]already confirmed[/dim]",
+                )
+                progress.update(main_task, advance=1)
+                continue
+
             # Check if feed was muted before processing
             was_muted_before = feed.muted
-            
+
             # Update the progress description with feed title
-            progress.update(main_task, description=f"[bold blue]Processing: [cyan]{feed.title[:40]}")
-            
+            progress.update(main_task, description=f"[bold blue]Processing: [cyan]{feed_title[:40]}")
+
             # Add timing information
             feed_start_time = time.time()
-            
+
             # Create a progress callback that updates the task description
-            def update_progress(msg):
-                progress.update(main_task, description=f"[bold blue]{msg[:40]}")
-            
+            def update_progress(msg, _task=main_task):
+                progress.update(_task, description=f"[bold blue]{msg[:40]}")
+
+            manifest.mark_started(plan)
+            # Record the in-flight source before touching the network so a
+            # crash leaves it as unconfirmed work for the next retry.
+            _save_manifest_quietly(manifest)
+
             # Process the feed
-            new_articles, jina_enhanced, with_summary, with_value = process_feed(
+            result = process_feed(
                 feed,
-                db_session, 
+                db_session,
                 lookback_days=lookback_days,
                 max_articles=max_articles_per_feed,
                 progress_callback=update_progress,
                 max_errors=max_errors,
                 retry_attempts=retry_attempts,
                 config=config,
-                analyze_content=analyze_content
+                analyze_content=analyze_content,
+                entry_ranges=plan.intervals,
+                window_start=plan.window_start,
+                window_end=plan.window_end,
             )
-            
+            manifest.record(result)
+            _save_manifest_quietly(manifest)
+
             # Calculate processing time
             feed_duration = time.time() - feed_start_time
-            
+
+            if result.status == STATUS_FAILED:
+                failed_sources.append(plan.url)
+
             # Update stats field with colorful information
-            stats_text = f"[green]new:[/green] {new_articles} [yellow]jina:[/yellow] {jina_enhanced} [blue]summary:[/blue] {with_summary} [magenta]value:[/magenta] {with_value} [cyan]time:[/cyan] {feed_duration:.1f}s"
+            status_note = "" if result.status == STATUS_SUCCESS else f" [red]{result.status}[/red]"
+            stats_text = (
+                f"[green]new:[/green] {result.articles_new} "
+                f"[yellow]jina:[/yellow] {result.jina_enhanced} "
+                f"[blue]summary:[/blue] {result.with_summary} "
+                f"[magenta]value:[/magenta] {result.with_value} "
+                f"[cyan]time:[/cyan] {feed_duration:.1f}s{status_note}"
+            )
             progress.update(main_task, stats=stats_text)
-            
+
+            total_new_articles += result.articles_new
+            total_jina_enhanced += result.jina_enhanced
+            total_with_summary += result.with_summary
+            total_with_value += result.with_value
+
+            # Check if feed was auto-muted during processing
+            if not was_muted_before and feed.muted:
+                auto_muted_count += 1
+
             # Advance the progress
             progress.update(main_task, advance=1)
-        total_new_articles += new_articles
-        total_jina_enhanced += jina_enhanced
-        total_with_summary += with_summary
-        total_with_value += with_value
-        
-        # Check if feed was auto-muted during processing
-        if not was_muted_before and feed.muted:
-            auto_muted_count += 1
-    
+
     # Log summary of auto-muted feeds
     if auto_muted_count > 0:
         logger.warning(f"Auto-muted {auto_muted_count} feeds due to persistent errors")
-    
+
+    if skipped_count:
+        logger.info(f"Skipped {skipped_count} feeds whose ranges were already confirmed")
+
     return {
-        "feeds_processed": len(feeds),
+        "feeds_processed": len(plans) - skipped_count,
+        "feeds_planned": len(plans),
+        "feeds_skipped": skipped_count,
         "new_articles": total_new_articles,
         "auto_muted": auto_muted_count,
         "jina_enhanced": total_jina_enhanced,
         "with_summary": total_with_summary,
-        "with_value_analysis": total_with_value
+        "with_value_analysis": total_with_value,
+        "failed_sources": failed_sources,
+        "manifest_summary": manifest.summary_dict(),
     }
+
+
+def _save_manifest_quietly(manifest: IngestManifest) -> None:
+    """Persist the manifest to its origin path; ignore I/O errors."""
+    if not manifest.path:
+        return
+    try:
+        manifest.save()
+    except OSError as exc:
+        logger.warning(f"Could not save ingest manifest to {manifest.path}: {exc}")
